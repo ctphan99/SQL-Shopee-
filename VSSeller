@@ -1,0 +1,256 @@
+WITH
+grass_date(grass_date) AS
+    (SELECT * FROM UNNEST(SEQUENCE(date '2021-01-01', current_date - interval '1' day))),
+    
+group_cat AS (
+    SELECT *
+    FROM shopee_vn.shopee_vn_bi_team__bd_group_cat
+    WHERE (ingestion_timestamp = (SELECT "max"(ingestion_timestamp) col_1 FROM shopee_vn.shopee_vn_bi_team__bd_group_cat ))
+    ),
+
+main_cat AS (
+    SELECT DISTINCT
+        grass_date
+        , shop_id
+        , shop_level1_category main_category
+  -- , active_item_with_stock_cnt live_sku
+    FROM
+        shopee_vn.item_mart_dws_shop_listing_td
+    WHERE 
+        grass_date between date_add('month', -4, date_trunc('month', current_date - interval '1' day)) AND date_add('day',-1,current_date)
+    ),
+    
+managed_sellers AS (
+SELECT DISTINCT
+    g.grass_date
+    , try_cast(shopid as bigint) as shop_id
+    , CASE 
+        WHEN function in ('Retail') THEN 'OS-MS SBS'
+        WHEN function in ('Mall') THEN 'OS-MS non SBS'
+        WHEN function IN ('SKAM') THEN 'SKAM'
+    ELSE 'C2C' END AS function 
+    , CASE 
+        WHEN seller_type IN ('ST current', 'ST') THEN 'ST'
+        WHEN seller_type = 'LT' THEN 'LT'
+    ELSE 'MT' END AS seller_type
+    , case when group_cat = 'EL&HA' then 'ELHA' else group_cat end as ms_group_cat
+    , cat ms_cat
+    , incubator pic
+FROM 
+    shopee_vn_bi_team__all_managed_seller_including_rmkpi m 
+JOIN 
+    grass_date g 
+ON
+    date(valid_date) = date_trunc('month', g.grass_date)
+),
+
+shop_l30d_ado AS 
+(SELECT 
+    o.shop_id
+    , try_cast(count(distinct order_id) as double)/30 AS l30d_ado 
+    , try_cast(sum(gmv_usd) as double)/30 AS l30d_adgmv
+    , try_cast(count(distinct case when is_net_order = 1 then order_id end ) as double)/30 AS l30d_ado_net 
+    , try_cast(sum(case when is_net_order = 1 then gmv_usd end) as double)/30 AS l30d_adgmv_net    
+FROM 
+    shopee_vn.order_mart_dwd_order_all_event_final_status_df o 
+WHERE
+    date(split(o.create_datetime, ' ')[1]) BETWEEN date_add('day',-29,current_date - interval '1' day) AND current_date - interval '1' day
+AND 
+    bi_exclude_reason IS NULL
+AND 
+    o.grass_date >= date_add('day',-29,current_date - interval '1' day)
+GROUP BY 1
+),
+
+incu_raw AS ( --SMA and Incubation
+-- not yet passed end_date
+    (SELECT DISTINCT try_cast(shopid AS BIGINT) AS shopid, programme AS seller_type, DATE(start_date) AS start_date, current_date - interval '1' day AS end_date
+    FROM shopee_vn.shopee_vn_op_team__ssx_seller_programme
+    WHERE ingestion_timestamp = (SELECT MAX(ingestion_timestamp) FROM shopee_vn.shopee_vn_op_team__ssx_seller_programme)
+    AND check_in_post_prog_sheet = 'Not in post prog sheet'
+    )
+UNION ALL 
+-- pass end_date but not graduate
+(SELECT * FROM
+    (
+        WITH latest_update AS 
+            (SELECT 
+                shopid 
+                , MAX(DATE(update_date)) AS latest_update 
+            FROM 
+                shopee_vn.shopee_vn_op_team__sma_icu_post_prog 
+            WHERE 
+                ingestion_timestamp = (SELECT MAX(ingestion_timestamp) FROM shopee_vn.shopee_vn_op_team__sma_icu_post_prog) 
+            GROUP BY 
+                1 
+                )
+    SELECT DISTINCT try_cast(p.shopid AS BIGINT) AS shopid, p.programme AS seller_type, DATE(p.start_date) AS start_date, COALESCE(TRY_CAST(p.release_date AS DATE), current_date - interval '1' day) AS end_date
+    FROM shopee_vn.shopee_vn_op_team__sma_icu_post_prog p 
+    INNER JOIN latest_update l 
+    ON p.ingestion_timestamp = (SELECT MAX(ingestion_timestamp) FROM shopee_vn.shopee_vn_op_team__sma_icu_post_prog)
+    AND l.shopid = p.shopid AND l.latest_update = DATE(p.update_date)
+    )
+    )
+),
+incu_sma AS (
+SELECT DISTINCT
+    g.grass_date,
+    r.shopid as shop_id,
+    r.seller_type
+FROM 
+    incu_raw r 
+JOIN 
+    grass_date g 
+ON
+    g.grass_date BETWEEN r.start_date AND r.end_date
+),
+incu_lite_raw AS (
+SELECT DISTINCT
+    try_cast(shopid as bigint) as shopid,
+    date(reg_date) as start_date,
+    current_date - interval '1' day as end_date
+FROM 
+    shopee_vn_bi_team__official_reg_seller_incu_lite i 
+WHERE 
+    ingestion_timestamp = (SELECT max(ingestion_timestamp) FROM shopee_vn_bi_team__official_reg_seller_incu_lite)
+),   
+incu_lite AS (
+SELECT DISTINCT
+    g.grass_date,
+    r.shopid as shop_id,
+    'Incubation Lite' as seller_type
+FROM 
+    incu_lite_raw r
+JOIN 
+    grass_date g 
+ON 
+    g.grass_date BETWEEN r.start_date AND r.end_date
+),
+ccb_seller_list AS (
+(
+      SELECT
+        cast(shop_id as bigint) shop_id
+      , (CASE WHEN (start_time IS NULL) THEN (current_date - INTERVAL  '1' DAY) ELSE TRY_CAST(start_time AS date) END) start_time
+      , (CASE WHEN (start_time IS NULL) THEN (current_date - INTERVAL  '1' DAY) ELSE TRY_CAST(end_time AS date) END) end_time
+      , 1 is_ccb
+      FROM
+        shopee_vn.shopee_vn_bi_team__ccb_seller_list
+      WHERE (ingestion_timestamp = (SELECT "max"(ingestion_timestamp) col_2
+FROM
+  shopee_vn.shopee_vn_bi_team__ccb_seller_list
+))
+   ) UNION ALL (
+      SELECT
+        cast(shopid as bigint) shop_id
+      , (CASE WHEN (start_time IS NULL) THEN (current_date - INTERVAL  '1' DAY) ELSE TRY_CAST(start_time AS date) END) start_time
+      , (CASE WHEN (start_time IS NULL) THEN (current_date - INTERVAL  '1' DAY) ELSE TRY_CAST(end_time AS date) END) end_time
+      , 2 is_ccb
+      FROM
+        shopee_vn.shopee_vn_bi_team__ccb_free_trial_list
+      WHERE (ingestion_timestamp = (SELECT "max"(ingestion_timestamp) col_3
+FROM
+  shopee_vn.shopee_vn_bi_team__ccb_free_trial_list
+))
+   ) ),
+   
+retail AS (
+SELECT DISTINCT 
+    -- grass_date,
+    shopid
+FROM 
+    shopee_vn_bd_sbs_mart
+WHERE  
+    grass_date = (SELECT max(grass_date) FROM shopee_vn_bd_sbs_mart)
+AND 
+    is_sbs = 1),
+    
+ccb_list AS (
+   SELECT
+     grass_date
+   , cast(f.shop_id as bigint) shop_id
+   , start_time
+   , end_time
+   , "min"(is_ccb) is_ccb
+   FROM
+     (ccb_seller_list f
+   INNER JOIN grass_date g ON (g.grass_date BETWEEN "date"(f.start_time) AND COALESCE("date"(f.end_time), (current_date - INTERVAL  '1' DAY)))
+   ) where f.start_time between date '2021-05-01' and date '2021-06-30'
+   GROUP BY 1, 2, 3, 4
+)
+
+,final_sellers AS (
+SELECT DISTINCT
+    u.shop_id
+    , COALESCE(ms_group_cat,g.group_cat,'Others') group_cat
+    , COALESCE(ms_cat,main_category,'Others') main_category 
+    , CASE 
+        WHEN is_cb_shop = 1 then 'CB'
+        WHEN m.function IN ('OS-MS SBS','OS-MS non SBS') THEN 'OS-MS'
+        WHEN r.shopid is not null then 'OS-Retail'
+        WHEN is_official_shop = 1 then 'OS-NonRetail'
+        WHEN i.seller_type in ('SMA','Incubation') THEN 'SMA/Incubation' --Shop Mgmt Agent - Shopee manage shop 
+        WHEN i.seller_type = 'Incubation' THEN 'Incubation' 
+        WHEN il.shop_id IS NOT NULL THEN 'Incubation Lite'
+        WHEN m.seller_type = 'ST' then 'MS-MP-ST'
+        WHEN m.seller_type = 'MT' then 'MS-MP-MT'
+        WHEN m.seller_type = 'LT' then 'MS-MP-LT'
+        WHEN COALESCE(s.l30d_ado, 0) >= 20 THEN 'NonMS-MP-ST'
+        WHEN COALESCE(s.l30d_ado, 0) >= 5 AND COALESCE(s.l30d_ado, 0) < 20 THEN 'NonMS-MP-MT' 
+        ELSE 'NonMS-MP-LT' END AS seller_type
+    , CASE
+        WHEN is_ccb = 1 then 'Paid'
+        WHEN is_ccb = 2 then 'Free'
+        ELSE 'Non-CCB' END AS ccb_status
+    -- , CASE WHEN m.shop_id is not null then 1 else 0 end as is_managed
+FROM 
+    user_mart_dim_shop u 
+JOIN  
+    grass_date g ON u.grass_date = g.grass_date
+LEFT JOIN 
+    managed_sellers m ON u.shop_id = m.shop_id AND u.grass_date = m.grass_date
+LEFT JOIN 
+    ccb_list c ON c.grass_date = u.grass_date AND c.shop_id = u.shop_id
+LEFT JOIN 
+    shop_l30d_ado s ON u.shop_id = s.shop_id
+LEFT JOIN 
+    incu_sma i ON u.shop_id = i.shop_id AND u.grass_date = i.grass_date
+LEFT JOIN 
+    incu_lite il ON u.shop_id = il.shop_id AND u.grass_date = il.grass_date
+LEFT JOIN
+    retail r on r.shopid = u.shop_id 
+LEFT JOIN
+    main_cat m2 ON m2.shop_id = u.shop_id AND m2.grass_date = u.grass_date
+LEFT JOIN 
+    group_cat g ON g.cat = m2.main_category
+WHERE true
+     AND g.grass_date = date_add('day',-1,current_date)
+     AND m.shop_id is null
+     
+)
+
+, platform_sales as (
+select
+    date(split(create_datetime, ' ')[1]) grass_date
+    , c.shop_id
+    , group_cat
+    , main_category
+    , seller_type
+    , ccb_status
+    , sum(a.order_fraction) as ado
+    , sum(case when level1_category = 'Voucher & Service' then order_fraction end) VS_ado
+    , sum(a.gmv_usd) adgmv
+    , sum(case when level1_category = 'Voucher & Service' then gmv_usd end) VS_adgmv
+    , count(distinct (model_id,item_id )) SKU
+    , count(distinct case when level1_category = 'Voucher & Service' then (model_id,item_id) end) VS_SKU
+    
+from order_mart_dwd_order_item_all_event_final_status_df a
+right join final_sellers c on a.shop_id = c.shop_id 
+where true
+    and date(split(create_datetime, ' ')[1]) BETWEEN date_add('day',-29,current_date - interval '1' day) AND date_add('day',-1,current_date)
+    and is_bi_excluded = 0
+group by 1,2,3,4,5,6
+)
+
+SELECT *
+from platform_sales
+where VS_SKU>0
